@@ -3,6 +3,8 @@ import { exec } from "child_process";
 import fs from "fs";
 import { promisify } from "util";
 import { MongoClient } from "mongodb";
+import { connect, StringCodec } from 'nats';
+
 
 const execPromise = promisify(exec);  // Allows using async/await for shell commands
 const BROKER_URL = process.env.BROKER_URL || 'amqp://localhost';
@@ -23,18 +25,33 @@ const connectRabbitMQ = async () => {
         ch = await conn?.createChannel();
 
     } catch (error) {
-        console.log("Oops something went wrong during connection!")
+        console.log("Oops something went wrong during RabbitMQ connection!")
         console.log(error);
     }
 
     let queue = "c-code-queue";
     await ch.assertQueue(queue, { durable: true });
 
+    console.log("✅ Connected to RabbitMQ");
     return ch;
+};
+
+let nc = null;
+let js = null;
+let sc = StringCodec();
+
+const initJetStream = async () => {
+    if (!nc) {
+        nc = await connect({ servers: "localhost:4222" }); // Or from env var
+        js = nc.jetstream();
+        console.log("✅ Connected to JetStream");
+    }
+    return { nc, js, sc };
 };
 
 (async () => {
     const channel = await connectRabbitMQ();
+    await initJetStream();
     const queue = `c-code-queue`;  // This worker only listens to the C language queue
 
     console.log(`[*] Waiting for messages in ${queue}`);
@@ -42,7 +59,7 @@ const connectRabbitMQ = async () => {
     // Consumes messages from the RabbitMQ queue
     channel.consume(queue, async (msg) => {
         if (msg !== null) {
-            const { sourceCode, jobId, testcases } = JSON.parse(msg.content.toString());
+            const { sourceCode, id, qid, jobId, testcases, submissionId, questionTitle, problemSetterName } = JSON.parse(msg.content.toString());
             let testCases = [];
             testcases.forEach(testcase => testCases.push(testcase.input));
             console.log(`Received testcases:\n${testCases}`);
@@ -50,18 +67,23 @@ const connectRabbitMQ = async () => {
             console.log(`Received C Code:\n${sourceCode}`);
 
             try {
-                const output = await executeCode(sourceCode, testcases);
-                console.log(`Execution Result: ${output}`);
+                const results = await executeCode(sourceCode, testcases);
+                console.log(`Execution Result: ${results}`);
 
                 // Store the result in MongoDB
                 let updateResult = await collection.updateOne({ jobId: jobId }, {
                     $set: {
                         executionStatus: "executed",
-                        results: output
+                        results
                     }
                 });
-                updateResult = updateResult.modifiedCount === 1 ? 'Document updated successfully' : 'Something went wrong while updating document';
-                console.log(updateResult);
+                const isExecuted = updateResult.modifiedCount === 1 ? '✅ Document updated successfully' : 'Something went wrong while updating document';
+                console.log(isExecuted);
+
+                if (updateResult.modifiedCount === 1) {
+
+                    await publishMessage(id, submissionId, questionTitle, problemSetterName, qid, results);
+                }
             } catch (error) {
                 console.error(`Error executing C code: ${error.message}`);
             }
@@ -70,6 +92,29 @@ const connectRabbitMQ = async () => {
         }
     });
 })();
+
+async function publishMessage(id, submissionId, questionTitle, problemSetterName, qid, results) {
+    let status = 'AC';
+
+    results.forEach((r) => {
+        if (!r.isCorrect) {
+            status = 'WA';
+        }
+    })
+
+    try {
+        await js.publish("user.submission.created", sc.encode(JSON.stringify({
+            submissionId,
+            id, qid, questionTitle,
+            problemSetter: problemSetterName,
+            status: status
+        })));
+        console.log("message published successfully!")
+    } catch (error) {
+        console.log("❌ Failed to publish message to JetStream:", error)
+    }
+
+}
 
 // Function to execute C code
 async function executeCode(sourceCode, testCases) {
