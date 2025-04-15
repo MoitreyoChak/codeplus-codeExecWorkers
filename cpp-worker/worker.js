@@ -6,10 +6,11 @@ import { MongoClient } from "mongodb";
 import { connect, StringCodec } from 'nats';
 
 
-const execPromise = promisify(exec);  // Allows using async/await for shell commands
+const execPromise = promisify(exec);
 const BROKER_URL = process.env.BROKER_URL || 'amqp://localhost';
 const NATS_URL = process.env.NATS_URL || "nats://localhost:4222";
-const MONGO_URI = process.env.MONGO_URI || "mongodb://localhost:27017/userdb" // during local dev
+const MONGO_URI = process.env.MONGO_URI || "mongodb://localhost:27017/userdb"
+// const MONGO_URI = "mongodb://localhost:27017/userdb";  // during local dev
 // const MONGO_URI = "mongodb://ques-mongo-srv:27017/userdb"; // during k8s dev
 let ch = null;
 
@@ -19,17 +20,17 @@ const db = mongoClient.db("userdb");
 const collection = db.collection("submissions");
 
 const connectRabbitMQ = async () => {
-    if (ch) return ch; // Return existing channel if already connected
+    if (ch) return ch;
 
     try {
         const conn = await amqp.connect(BROKER_URL);
         ch = await conn?.createChannel();
     } catch (error) {
-        console.log("Oops something went wrong during RabbitMQ connection!")
+        console.log("Oops something went wrong during RabbitMQ connection!");
         console.log(error);
     }
 
-    let queue = "c-code-queue";
+    let queue = "cpp-code-queue";
     await ch.assertQueue(queue, { durable: true });
 
     console.log("✅ Connected to RabbitMQ");
@@ -42,6 +43,8 @@ let sc = StringCodec();
 
 const initJetStream = async () => {
     if (!nc) {
+        console.log("🔧 NATS_URL ENV:", process.env.NATS_URL);
+        console.log("🔧 Using NATS_URL:", NATS_URL);
 
         nc = await connect({ servers: NATS_URL });
         js = nc.jetstream();
@@ -53,11 +56,10 @@ const initJetStream = async () => {
 (async () => {
     const channel = await connectRabbitMQ();
     await initJetStream();
-    const queue = `c-code-queue`;  // This worker only listens to the C language queue
+    const queue = `cpp-code-queue`;
 
     console.log(`[*] Waiting for messages in ${queue}`);
 
-    // Consumes messages from the RabbitMQ queue
     channel.consume(queue, async (msg) => {
         if (msg !== null) {
             const { sourceCode, id, qid, jobId, testcases, submissionId, questionTitle, problemSetterName } = JSON.parse(msg.content.toString());
@@ -65,19 +67,19 @@ const initJetStream = async () => {
             testcases.forEach(testcase => testCases.push(testcase.input));
             console.log(`Received testcases:\n${testCases}`);
             console.log(`jobid : ${jobId}`);
-            console.log(`Received C Code:\n${sourceCode}`);
+            console.log(`Received C++ Code:\n${sourceCode}`);
 
             try {
                 const results = await executeCode(sourceCode, testcases);
                 console.log(`Execution Result: ${results}`);
 
-                // Store the result in MongoDB
                 let updateResult = await collection.updateOne({ jobId: jobId }, {
                     $set: {
                         executionStatus: "executed",
                         results
                     }
                 });
+
                 const isExecuted = updateResult.modifiedCount === 1 ? '✅ Document updated successfully' : 'Something went wrong while updating document';
                 console.log(isExecuted);
 
@@ -85,10 +87,10 @@ const initJetStream = async () => {
                     await publishMessage(id, submissionId, questionTitle, problemSetterName, qid, results);
                 }
             } catch (error) {
-                console.error(`Error executing C code: ${error.message}`);
+                console.error(`Error executing C++ code: ${error.message}`);
             }
 
-            channel.ack(msg);  // Acknowledge the message so RabbitMQ removes it from the queue
+            channel.ack(msg);
         }
     });
 })();
@@ -109,40 +111,32 @@ async function publishMessage(id, submissionId, questionTitle, problemSetterName
             problemSetter: problemSetterName,
             status: status
         })));
-        console.log("message published successfully!")
+        console.log("message published successfully!");
     } catch (error) {
-        console.log("❌ Failed to publish message to JetStream:", error)
+        console.log("❌ Failed to publish message to JetStream:", error);
     }
-
 }
 
-// Function to execute C code
 async function executeCode(sourceCode, testCases) {
-    const filename = `code.c`;
+    const filename = `code.cpp`;
     const outputFile = `output`;
 
-    // Write the received C code to a file inside the container
     fs.writeFileSync(filename, sourceCode);
 
-    // Compile and execute the C code
-    const compileCommand = `gcc ${filename} -o ${outputFile}`;
-    await execPromise(compileCommand);  // Compile the C code
-
-    // const executeCommand = `./${outputFile}`; // during k8s dev (ubuntu)
-    // const executeCommand = `${outputFile}.exe`; // during local dev (windows)
+    const compileCommand = `g++ ${filename} -o ${outputFile}`;
+    await execPromise(compileCommand);
 
     let testResults = [];
-    // Run each test case
+
     for (const testCase of testCases) {
         const { input, expectedOutput } = testCase;
 
         try {
-            // Execute with input redirection
-            // const { stdout } = await execPromise(`echo "${input}" | ./${outputFile}`); // during k8s dev (ubuntu)
-            const { stdout } = await execPromise(`echo ${input} | ${outputFile}.exe`); // during local dev (windows)
+            // const { stdout } = await execPromise(`echo ${input} | ${outputFile}.exe`); // during local dev (windows)
+            const { stdout } = await execPromise(`echo "${input}" | ./${outputFile}`); // during k8s dev (ubuntu)
 
             const actualOutput = stdout.trim();
-            const isCorrect = actualOutput === expectedOutput ? true : false;
+            const isCorrect = actualOutput === expectedOutput;
 
             testResults.push({ input, expectedOutput, actualOutput, isCorrect });
         } catch (error) {
@@ -150,10 +144,5 @@ async function executeCode(sourceCode, testCases) {
         }
     }
 
-
-    // const { stdout, stderr } = await execPromise(executeCommand);  // Execute the compiled binary
-    // return stdout || stderr;  // Return the execution output
     return testResults;
 }
-
-
