@@ -11,9 +11,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "amqplib": "^0.10.5",
-    "dockerode": "^4.0.4",
-    "express": "^4.21.2",
+    "amqplib": "^0.10.7",
     "mongodb": "^6.15.0",
     "nats": "^2.29.3"
   }
